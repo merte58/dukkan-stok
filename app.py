@@ -1,25 +1,21 @@
 import streamlit as st
 import pandas as pd
 import requests
-from streamlit_gsheets import GSheetsConnection
+from sqlalchemy import text
 
-# Sayfa Yapılandırması
 st.set_page_config(page_title="Fiyat & Kur Takip Sistemi", layout="wide")
 
-# Google Sheets Bağlantısı
-conn = st.connection("gsheets", type=GSheetsConnection)
+# PostgreSQL / Supabase Bağlantısı
+conn = st.connection("postgresql", type="sql")
 
 def get_data():
     try:
-        df = conn.read(ttl="0s")
-        return df.dropna(how="all")
+        df = conn.query("SELECT * FROM urunler ORDER BY id DESC;", ttl="0s")
+        return df
     except Exception:
-        return pd.DataFrame(columns=[
-            "barkod", "urun_adi", "raf_konumu", "liste_fiyati",
-            "para_birimi", "tedarikci_iskonto", "kar_marji", "kdv_orani", "stok_adedi"
-        ])
+        return pd.DataFrame()
 
-# TCMB / Serbest Piyasa Anlık Kur Çekme Fonksiyonu
+# Anlık Kur Çekme
 @st.cache_data(ttl=300)
 def get_live_rates():
     try:
@@ -33,7 +29,7 @@ def get_live_rates():
 
 kurlar = get_live_rates()
 
-# Üst Bar - Anlık Kur Göstergesi
+# Üst Bar - Kur Göstergesi
 st.title("⚡ Mağaza Fiyat & Kur Yönetim Paneli")
 col_usd, col_eur, col_refresh = st.columns([1, 1, 1])
 col_usd.metric("Dolar Kuru (USD/TRY)", f"₺{kurlar['USD']}")
@@ -44,12 +40,11 @@ if col_refresh.button("🔄 Kurları Yenile"):
 
 st.divider()
 
-# Sekmeler
 tab_liste, tab_ekle, tab_duzenle = st.tabs(["📦 Fiyat & Stok Listesi", "➕ Yeni Ürün Ekle", "✏️ Ürün Düzenle / Sil"])
 
 # 1. SEKME: LİSTELEME
 with tab_liste:
-    st.subheader("Google Sheets Bağlantılı Güncel Liste")
+    st.subheader("Bulut Veritabanı Güncel Liste")
     df = get_data()
 
     if not df.empty and "urun_adi" in df.columns:
@@ -71,9 +66,10 @@ with tab_liste:
         df[["Maliyet (TL)", "Satış (KDV Hariç)", "Nihai Satış (KDV Dahil)"]] = df.apply(hesapla_fiyatlar, axis=1)
 
         gosterilecek_tablo = df[[
-            "barkod", "urun_adi", "raf_konumu", "stok_adedi", "liste_fiyati", "para_birimi",
+            "id", "barkod", "urun_adi", "raf_konumu", "stok_adedi", "liste_fiyati", "para_birimi",
             "tedarikci_iskonto", "kar_marji", "Maliyet (TL)", "Nihai Satış (KDV Dahil)"
         ]].rename(columns={
+            "id": "ID",
             "barkod": "Barkod/Kod",
             "urun_adi": "Ürün Adı",
             "raf_konumu": "Dükkan / Raf Konumu",
@@ -104,7 +100,7 @@ with tab_liste:
             mime="text/csv"
         )
     else:
-        st.info("Google Sheets tablonuzda henüz veri yok veya ilk satır başlıkları bekleniyor.")
+        st.info("Veritabanında henüz ürün bulunmuyor. Sol menüden ilk ürününüzü ekleyebilirsiniz.")
 
 # 2. SEKME: YENİ ÜRÜN EKLEME
 with tab_ekle:
@@ -127,39 +123,44 @@ with tab_ekle:
         kdv_orani = col5.selectbox("KDV (%)", [20, 10, 1], index=0)
         stok_adedi = col6.number_input("Mevcut Stok", min_value=0, value=10, step=1)
         
-        kaydet = st.form_submit_button("➕ Google Sheets'e Kaydet", use_container_width=True)
+        kaydet = st.form_submit_button("➕ Veritabanına Kaydet", use_container_width=True)
         
         if kaydet:
             if urun_adi:
-                mevcut_df = get_data()
-                yeni_satir = pd.DataFrame([{
-                    "barkod": str(barkod),
-                    "urun_adi": str(urun_adi),
-                    "raf_konumu": str(raf_konumu),
-                    "liste_fiyati": float(liste_fiyati),
-                    "para_birimi": str(para_birimi),
-                    "tedarikci_iskonto": float(tedarikci_iskonto),
-                    "kar_marji": float(kar_marji),
-                    "kdv_orani": float(kdv_orani),
-                    "stok_adedi": int(stok_adedi)
-                }])
-                guncel_df = pd.concat([mevcut_df, yeni_satir], ignore_index=True)
-                conn.update(data=guncel_df)
-                st.success(f"'{urun_adi}' Google Sheets tablonuza eklendi!")
+                with conn.session as s:
+                    s.execute(
+                        text("""
+                            INSERT INTO urunler (barkod, urun_adi, raf_konumu, liste_fiyati, para_birimi, tedarikci_iskonto, kar_marji, kdv_orani, stok_adedi)
+                            VALUES (:barkod, :urun_adi, :raf_konumu, :liste_fiyati, :para_birimi, :tedarikci_iskonto, :kar_marji, :kdv_orani, :stok_adedi)
+                        """),
+                        {
+                            "barkod": str(barkod),
+                            "urun_adi": str(urun_adi),
+                            "raf_konumu": str(raf_konumu),
+                            "liste_fiyati": float(liste_fiyati),
+                            "para_birimi": str(para_birimi),
+                            "tedarikci_iskonto": float(tedarikci_iskonto),
+                            "kar_marji": float(kar_marji),
+                            "kdv_orani": float(kdv_orani),
+                            "stok_adedi": int(stok_adedi)
+                        }
+                    )
+                    s.commit()
+                st.success(f"'{urun_adi}' veritabanına başarıyla eklendi!")
                 st.rerun()
             else:
                 st.error("Lütfen ürün adını girin.")
 
-# 3. SEKME: ÜRÜN DÜZENLEME & SİLME
+# 3. SEKME: DÜZENLEME & SİLME
 with tab_duzenle:
     st.subheader("Mevcut Ürünü Düzenle veya Sil")
     df_duzenle = get_data()
 
     if not df_duzenle.empty and "urun_adi" in df_duzenle.columns:
-        secenekler = [f"{idx} - {row['urun_adi']} (Raf: {row.get('raf_konumu', '')})" for idx, row in df_duzenle.iterrows()]
-        secilen_idx_str = st.selectbox("Düzenlenecek Ürünü Seçin:", secenekler)
-        secilen_index = int(secilen_idx_str.split(" - ")[0])
-        secilen_urun = df_duzenle.loc[secilen_index]
+        secenekler = {f"{row['urun_adi']} (ID: {row['id']} | Raf: {row.get('raf_konumu', '')})": row["id"] for _, row in df_duzenle.iterrows()}
+        secilen_etiket = st.selectbox("Düzenlenecek Ürünü Seçin:", list(secenekler.keys()))
+        secilen_id = secenekler[secilen_etiket]
+        secilen_urun = df_duzenle[df_duzenle["id"] == secilen_id].iloc[0]
 
         with st.form("duzenle_form"):
             col_d1, col_d2 = st.columns(2)
@@ -184,26 +185,41 @@ with tab_duzenle:
             d_stok = col_d8.number_input("Mevcut Stok", min_value=0, value=int(secilen_urun.get("stok_adedi", 0)), step=1)
 
             col_btn1, col_btn2 = st.columns(2)
-            guncelle_btn = col_btn1.form_submit_button("💾 Değişiklikleri Google Sheets'e Kaydet", use_container_width=True)
-            sil_btn = col_btn2.form_submit_button("🗑️ Ürünü Tablodan Sil", use_container_width=True)
+            guncelle_btn = col_btn1.form_submit_button("💾 Değişiklikleri Kaydet", use_container_width=True)
+            sil_btn = col_btn2.form_submit_button("🗑️ Ürünü Sil", use_container_width=True)
 
             if guncelle_btn:
-                df_duzenle.at[secilen_index, "barkod"] = str(d_barkod)
-                df_duzenle.at[secilen_index, "urun_adi"] = str(d_urun_adi)
-                df_duzenle.at[secilen_index, "raf_konumu"] = str(d_raf)
-                df_duzenle.at[secilen_index, "liste_fiyati"] = float(d_liste)
-                df_duzenle.at[secilen_index, "para_birimi"] = str(d_para)
-                df_duzenle.at[secilen_index, "tedarikci_iskonto"] = float(d_iskonto)
-                df_duzenle.at[secilen_index, "kar_marji"] = float(d_kar)
-                df_duzenle.at[secilen_index, "kdv_orani"] = float(d_kdv)
-                df_duzenle.at[secilen_index, "stok_adedi"] = int(d_stok)
-                conn.update(data=df_duzenle)
+                with conn.session as s:
+                    s.execute(
+                        text("""
+                            UPDATE urunler
+                            SET barkod = :barkod, urun_adi = :urun_adi, raf_konumu = :raf_konumu,
+                                liste_fiyati = :liste_fiyati, para_birimi = :para_birimi,
+                                tedarikci_iskonto = :tedarikci_iskonto, kar_marji = :kar_marji,
+                                kdv_orani = :kdv_orani, stok_adedi = :stok_adedi
+                            WHERE id = :id
+                        """),
+                        {
+                            "barkod": str(d_barkod),
+                            "urun_adi": str(d_urun_adi),
+                            "raf_konumu": str(d_raf),
+                            "liste_fiyati": float(d_liste),
+                            "para_birimi": str(d_para),
+                            "tedarikci_iskonto": float(d_iskonto),
+                            "kar_marji": float(d_kar),
+                            "kdv_orani": float(d_kdv),
+                            "stok_adedi": int(d_stok),
+                            "id": int(secilen_id)
+                        }
+                    )
+                    s.commit()
                 st.success(f"'{d_urun_adi}' güncellendi!")
                 st.rerun()
 
             if sil_btn:
-                df_duzenle = df_duzenle.drop(index=secilen_index).reset_index(drop=True)
-                conn.update(data=df_duzenle)
+                with conn.session as s:
+                    s.execute(text("DELETE FROM urunler WHERE id = :id"), {"id": int(secilen_id)})
+                    s.commit()
                 st.warning("Ürün silindi.")
                 st.rerun()
     else:
