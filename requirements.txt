@@ -1,4 +1,5 @@
 streamlit
 pandas
 requests
-st-gsheets-connection
+psycopg2-binary
+sqlalchemy
