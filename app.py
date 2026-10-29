@@ -79,9 +79,9 @@ is_admin = kullanici["rol"] == "admin"
 with st.sidebar:
     st.title("⚡ Sinyal Elektrik")
     st.caption(f"{kullanici['email']} | {'Yönetici' if is_admin else 'Personel'}")
-    menu_items = ["🏠 Ana Sayfa", "🛒 Barkodlu Satış", "📦 Stok ve Fiyat Sorgula", "➕ Stok Girişi"]
+    menu_items = ["🏠 Ana Sayfa", "🛒 Barkodlu Satış", "📦 Stok ve Fiyat Sorgula", "➕ Stok Girişi", "↩️ Satış İptali", "✏️ Ürün Düzenle/Sil"]
     if is_admin:
-        menu_items += ["📊 Satış Raporları", "↩️ Satış İptali", "📖 Katalog", "📥 Katalog Yükle", "🆕 Ürün Ekle", "✏️ Ürün Düzenle/Sil"]
+        menu_items += ["📊 Satış Raporları", "📖 Katalog", "📥 Katalog Yükle", "🆕 Ürün Ekle"]
     menu = st.radio("İşlemler", menu_items, label_visibility="collapsed")
     if st.button("Güvenli Çıkış", use_container_width=True):
         st.session_state.auth_access_token = None
@@ -425,8 +425,10 @@ if is_admin and menu == "🆕 Ürün Ekle":
 # ----------------------------------------------------
 # 5. SEKME: DÜKKAN ÜRÜN DÜZENLE / SİL
 # ----------------------------------------------------
-if is_admin and menu == "✏️ Ürün Düzenle/Sil":
-    st.subheader("Dükkan Ürününü Düzenle veya Sil")
+if menu == "✏️ Ürün Düzenle/Sil":
+    st.subheader("Dükkan Ürününü Düzenle" + (" veya Sil" if is_admin else ""))
+    if not is_admin:
+        st.info("Personel ürün adı, barkod ve raf konumunu düzenleyebilir. Maliyet, iskonto, kâr, fiyat ve stok miktarı sadece yönetici tarafından değiştirilebilir. Stok eklemek için Stok Girişi menüsünü kullanın.")
     df_duzenle = get_dukkan_data()
 
     if not df_duzenle.empty and "urun_adi" in df_duzenle.columns:
@@ -441,60 +443,62 @@ if is_admin and menu == "✏️ Ürün Düzenle/Sil":
             d_urun_adi = col_d2.text_input("Ürün Adı", value=str(secilen_urun.get("urun_adi", "") or ""))
             d_raf = st.text_input("Dükkan Konumu / Raf", value=str(secilen_urun.get("raf_konumu", "") or ""))
 
-            col_d3, col_d4 = st.columns(2)
-            d_liste = col_d3.number_input("Liste Fiyatı", min_value=0.0, value=float(secilen_urun.get("liste_fiyati", 0.0)), step=1.0)
-            para_birimleri = ["USD", "EUR", "TRY"]
-            curr_val = str(secilen_urun.get("para_birimi", "USD"))
-            d_para = col_d4.selectbox("Birim", para_birimleri, index=para_birimleri.index(curr_val) if curr_val in para_birimleri else 0)
+            if is_admin:
+                col_d3, col_d4 = st.columns(2)
+                d_liste = col_d3.number_input("Liste Fiyatı", min_value=0.0, value=float(secilen_urun.get("liste_fiyati", 0.0)), step=1.0)
+                para_birimleri = ["USD", "EUR", "TRY"]
+                curr_val = str(secilen_urun.get("para_birimi", "USD"))
+                d_para = col_d4.selectbox("Birim", para_birimleri, index=para_birimleri.index(curr_val) if curr_val in para_birimleri else 0)
+                col_d5, col_d6 = st.columns(2)
+                d_iskonto = col_d5.number_input("Tedarikçi İskonto (%)", min_value=0.0, max_value=100.0, value=float(secilen_urun.get("tedarikci_iskonto", 0.0)))
+                d_kar = col_d6.number_input("Hedef Kâr (%)", min_value=0.0, value=float(secilen_urun.get("kar_marji", 0.0)))
+                col_d7, col_d8 = st.columns(2)
+                kdv_secenekleri = [20, 10, 1]
+                curr_kdv = int(secilen_urun.get("kdv_orani", 20))
+                d_kdv = col_d7.selectbox("KDV (%)", kdv_secenekleri, index=kdv_secenekleri.index(curr_kdv) if curr_kdv in kdv_secenekleri else 0)
+                d_stok = col_d8.number_input("Mevcut Stok Adedi", min_value=0, value=int(secilen_urun.get("stok_adedi", 0)), step=1)
 
-            col_d5, col_d6 = st.columns(2)
-            d_iskonto = col_d5.number_input("Tedarikçi İskonto (%)", min_value=0.0, max_value=100.0, value=float(secilen_urun.get("tedarikci_iskonto", 0.0)))
-            d_kar = col_d6.number_input("Hedef Kâr (%)", min_value=0.0, value=float(secilen_urun.get("kar_marji", 0.0)))
-
-            col_d7, col_d8 = st.columns(2)
-            kdv_secenekleri = [20, 10, 1]
-            curr_kdv = int(secilen_urun.get("kdv_orani", 20))
-            d_kdv = col_d7.selectbox("KDV (%)", kdv_secenekleri, index=kdv_secenekleri.index(curr_kdv) if curr_kdv in kdv_secenekleri else 0)
-            d_stok = col_d8.number_input("Mevcut Stok Adedi", min_value=0, value=int(secilen_urun.get("stok_adedi", 0)), step=1)
-
-            col_btn1, col_btn2 = st.columns(2)
-            guncelle_btn = col_btn1.form_submit_button("💾 Değişiklikleri Kaydet", use_container_width=True)
-            sil_btn = col_btn2.form_submit_button("🗑️ Ürünü Sil", use_container_width=True)
+            if is_admin:
+                col_btn1, col_btn2 = st.columns(2)
+                guncelle_btn = col_btn1.form_submit_button("💾 Değişiklikleri Kaydet", use_container_width=True)
+                sil_btn = col_btn2.form_submit_button("🗑️ Ürünü Sil", use_container_width=True)
+            else:
+                guncelle_btn = st.form_submit_button("💾 Ürün Bilgilerini Kaydet", use_container_width=True)
+                sil_btn = False
 
             if guncelle_btn:
-                with conn.session as s:
-                    s.execute(
-                        text("""
-                            UPDATE urunler
-                            SET barkod = :barkod, urun_adi = :urun_adi, raf_konumu = :raf_konumu,
-                                liste_fiyati = :liste_fiyati, para_birimi = :para_birimi,
-                                tedarikci_iskonto = :tedarikci_iskonto, kar_marji = :kar_marji,
-                                kdv_orani = :kdv_orani, stok_adedi = :stok_adedi
-                            WHERE id = :id
-                        """),
-                        {
-                            "barkod": str(d_barkod),
-                            "urun_adi": str(d_urun_adi),
-                            "raf_konumu": str(d_raf),
-                            "liste_fiyati": float(d_liste),
-                            "para_birimi": str(d_para),
-                            "tedarikci_iskonto": float(d_iskonto),
-                            "kar_marji": float(d_kar),
-                            "kdv_orani": float(d_kdv),
-                            "stok_adedi": int(d_stok),
-                            "id": int(secilen_id)
-                        }
-                    )
-                    s.commit()
-                st.success(f"'{d_urun_adi}' güncellendi!")
-                st.rerun()
+                if not d_urun_adi.strip():
+                    st.error("Ürün adı boş olamaz.")
+                else:
+                    try:
+                        with conn.session as db:
+                            # Sunucu tarafı ayrım: personelin SQL ifadesine asla fiyat/maliyet sütunları eklenmez.
+                            if is_admin:
+                                db.execute(text("""UPDATE urunler SET barkod=:barkod, urun_adi=:ad, raf_konumu=:raf,
+                                    liste_fiyati=:liste, para_birimi=:para, tedarikci_iskonto=:iskonto,
+                                    kar_marji=:kar, kdv_orani=:kdv, stok_adedi=:stok WHERE id=:id"""),
+                                    {"barkod":d_barkod.strip(), "ad":d_urun_adi.strip(), "raf":d_raf.strip(),
+                                     "liste":float(d_liste), "para":d_para, "iskonto":float(d_iskonto),
+                                     "kar":float(d_kar), "kdv":float(d_kdv), "stok":int(d_stok), "id":int(secilen_id)})
+                            else:
+                                db.execute(text("""UPDATE urunler SET barkod=:barkod, urun_adi=:ad,
+                                    raf_konumu=:raf WHERE id=:id"""),
+                                    {"barkod":d_barkod.strip(), "ad":d_urun_adi.strip(), "raf":d_raf.strip(), "id":int(secilen_id)})
+                            db.commit()
+                        st.success("Ürün bilgileri güncellendi.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Güncelleme başarısız: {exc}")
 
-            if sil_btn:
-                with conn.session as s:
-                    s.execute(text("DELETE FROM urunler WHERE id = :id"), {"id": int(secilen_id)})
-                    s.commit()
-                st.warning("Ürün silindi.")
-                st.rerun()
+            if sil_btn and is_admin:
+                try:
+                    with conn.session as db:
+                        db.execute(text("DELETE FROM urunler WHERE id = :id"), {"id":int(secilen_id)})
+                        db.commit()
+                    st.warning("Ürün silindi.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Silme başarısız: {exc}")
     else:
         st.info("Düzenlenecek dükkan ürünü bulunmuyor.")
 
@@ -531,7 +535,7 @@ if is_admin and menu == "📊 Satış Raporları":
     else:
         st.info("Henüz satış bulunmuyor.")
 
-if is_admin and menu == "↩️ Satış İptali":
+if menu == "↩️ Satış İptali":
     st.subheader("Satış İptali ve Stok İadesi")
     with conn.session as db:
         rows = db.execute(text("SELECT id, olusturma_zamani, toplam_tl FROM satislar WHERE durum='tamamlandi' ORDER BY id DESC LIMIT 100")).mappings().all()
@@ -542,6 +546,8 @@ if is_admin and menu == "↩️ Satış İptali":
         with conn.session as db:
             kalem = db.execute(text("SELECT urun_adi, miktar FROM satis_kalemleri WHERE satis_id=:s"), {"s":selection}).mappings().all()
         st.dataframe(pd.DataFrame([dict(k) for k in kalem]), hide_index=True, use_container_width=True)
+        if not is_admin:
+            st.caption("Personel yalnızca satışın ürünlerini ve adetlerini görür; toplam ciro ve maliyet bilgileri gösterilmez.")
         with st.form("iptal_form"):
             sebep = st.text_input("İptal nedeni")
             onay = st.checkbox("Bu satışın tamamını iptal edip stoklarını geri eklemek istiyorum.")
