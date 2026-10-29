@@ -3,6 +3,8 @@ import pandas as pd
 import requests
 from sqlalchemy import text
 import time
+import uuid
+from decimal import Decimal, ROUND_HALF_UP
 
 st.set_page_config(page_title="Sinyal Elektrik - Ürün Yönetim Sistemi", layout="wide")
 
@@ -57,12 +59,13 @@ if col_refresh.button("🔄 Kurları Yenile"):
 st.divider()
 
 # Sekmeler
-tab_katalog, tab_katalog_yukle, tab_liste, tab_ekle, tab_duzenle = st.tabs([
+tab_katalog, tab_katalog_yukle, tab_liste, tab_ekle, tab_duzenle, tab_satis = st.tabs([
     "📖 Katalog Fiyat Listesi",
     "📥 Katalog Ürün Yükle/Ekle",
     "📦 Dükkan Stok & Fiyat Listesi",
     "➕ Dükkana Ürün Ekle",
-    "✏️ Dükkan Ürün Düzenle/Sil"
+    "✏️ Dükkan Ürün Düzenle/Sil",
+    "🛒 Barkod & Satış"
 ])
 
 # ----------------------------------------------------
@@ -395,3 +398,197 @@ with tab_duzenle:
                 st.rerun()
     else:
         st.info("Düzenlenecek dükkan ürünü bulunmuyor.")
+
+# ----------------------------------------------------
+# 6. SEKME: BARKODLA SORGULAMA & SATIŞ
+# ----------------------------------------------------
+# Ön koşul: supabase_satis_kurulum.sql dosyası SQL Editor'da bir kez çalıştırılmalı.
+# Barkod okuyucunun USB HID (klavye) modunda ve Enter son ekiyle çalışması önerilir.
+
+def para_yuvarla(tutar):
+    return Decimal(str(tutar)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def urun_satis_fiyati(row, secili_kurlar):
+    kur = Decimal(str(secili_kurlar.get(str(row["para_birimi"]), 1.0)))
+    liste = Decimal(str(row["liste_fiyati"]))
+    iskonto = Decimal(str(row["tedarikci_iskonto"]))
+    kar = Decimal(str(row["kar_marji"]))
+    kdv = Decimal(str(row["kdv_orani"]))
+    tutar = liste * (1 - iskonto / 100) * kur * (1 + kar / 100) * (1 + kdv / 100)
+    return para_yuvarla(tutar)
+
+
+def fiyat_goster(tutar):
+    return f"{Decimal(str(tutar)):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") + " TL"
+
+
+if "satis_sepeti" not in st.session_state:
+    st.session_state.satis_sepeti = {}  # {urun_id: adet}
+if "satis_islem_no" not in st.session_state:
+    st.session_state.satis_islem_no = str(uuid.uuid4())
+
+with tab_satis:
+    st.subheader("🛒 Barkodla Fiyat Sorgula / Satış Yap")
+    if st.session_state.get("satis_basarili_mesaj"):
+        st.success(st.session_state.pop("satis_basarili_mesaj"))
+    st.caption("Barkod okuyucuyla okutun veya barkodu elle girin. Sorgulama stoktan düşmez; stok sadece satış onayında düşer.")
+    with st.form("barkod_okut_form", clear_on_submit=True):
+        barkod_sorgu = st.text_input("Barkod / Stok Kodu", placeholder="Barkodu okutun (Enter)")
+        eklenecek_adet = st.number_input("Sepete eklenecek adet", min_value=1, value=1, step=1)
+        barkod_ara = st.form_submit_button("🔎 Sorgula ve Sepete Ekle", use_container_width=True)
+
+    if barkod_ara:
+        barkod_deger = barkod_sorgu.strip()
+        if not barkod_deger:
+            st.warning("Lütfen barkod okutun veya kod girin.")
+        else:
+            try:
+                with conn.session as db:
+                    urunler = db.execute(
+                        text("SELECT * FROM urunler WHERE BTRIM(barkod) = :barkod ORDER BY id"),
+                        {"barkod": barkod_deger},
+                    ).mappings().all()
+                if not urunler:
+                    st.error("Bu barkod için ürün bulunamadı.")
+                elif len(urunler) > 1:
+                    st.error("Bu barkod birden fazla üründe kayıtlı. Ürün kayıtlarını düzeltmeden satış yapılamaz.")
+                else:
+                    urun = dict(urunler[0])
+                    urun_id = int(urun["id"])
+                    mevcut = int(urun["stok_adedi"])
+                    sepetteki = st.session_state.satis_sepeti.get(urun_id, 0)
+                    st.info(f"{urun['urun_adi']} | Raf: {urun.get('raf_konumu') or '-'} | Stok: {mevcut} | Fiyat: {fiyat_goster(urun_satis_fiyati(urun, kurlar))}")
+                    if sepetteki + int(eklenecek_adet) > mevcut:
+                        st.error("Yetersiz stok: sepetteki miktar da hesaba katıldı.")
+                    else:
+                        st.session_state.satis_sepeti[urun_id] = sepetteki + int(eklenecek_adet)
+                        st.success("Ürün sepete eklendi.")
+            except Exception as hata:
+                st.error(f"Barkod sorgusu başarısız: {hata}")
+
+    st.markdown("#### Satış Sepeti")
+    sepet = st.session_state.satis_sepeti
+    if not sepet:
+        st.info("Sepet boş. Satış yapmak için barkod okutun.")
+    else:
+        try:
+            with conn.session as db:
+                satirlar = db.execute(
+                    text("SELECT * FROM urunler WHERE id = ANY(:ids) ORDER BY id"),
+                    {"ids": list(sepet.keys())},
+                ).mappings().all()
+            bulunan = {int(r["id"]): dict(r) for r in satirlar}
+            onizleme = []
+            hata_var = False
+            toplam = Decimal("0.00")
+            for urun_id, adet in sepet.items():
+                if urun_id not in bulunan:
+                    st.error(f"ID {urun_id} ürün artık veritabanında bulunmuyor.")
+                    hata_var = True
+                    continue
+                u = bulunan[urun_id]
+                fiyat = urun_satis_fiyati(u, kurlar)
+                tutar = para_yuvarla(fiyat * adet)
+                toplam += tutar
+                if adet > int(u["stok_adedi"]):
+                    hata_var = True
+                onizleme.append({
+                    "ID": urun_id, "Ürün": u["urun_adi"], "Barkod": u["barkod"],
+                    "Adet": adet, "Mevcut Stok": int(u["stok_adedi"]),
+                    "Birim Satış (TL)": float(fiyat), "Tutar (TL)": float(tutar),
+                })
+            st.dataframe(pd.DataFrame(onizleme), use_container_width=True, hide_index=True)
+            st.metric("Sepet Toplamı (KDV dahil)", fiyat_goster(toplam))
+            if hata_var:
+                st.error("Sepette stok yetersizliği veya silinmiş ürün var. Satış onaylanamaz.")
+
+            col_sil, col_bosalt = st.columns(2)
+            with col_sil:
+                silinecek_id = st.selectbox(
+                    "Sepetten çıkarılacak ürün", list(sepet.keys()),
+                    format_func=lambda i: bulunan.get(i, {}).get("urun_adi", str(i)),
+                )
+                if st.button("➖ Seçili Ürünü Sepetten Çıkar"):
+                    sepet.pop(silinecek_id, None)
+                    st.rerun()
+            with col_bosalt:
+                st.write(" ")
+                if st.button("🗑️ Sepeti Temizle"):
+                    sepet.clear()
+                    st.session_state.satis_islem_no = str(uuid.uuid4())
+                    st.rerun()
+
+            st.warning("Satışı onayladığınızda ürün stokları kalıcı olarak azalır. İşlem tek veritabanı transaction'ında kaydedilir.")
+            satis_onay = st.button("✅ SATIŞI ONAYLA VE STOKTAN DÜŞ", type="primary", disabled=hata_var)
+            if satis_onay:
+                try:
+                    islem_no = st.session_state.satis_islem_no
+                    # İşlemin tamamı atomiktir: kilitle, kontrol et, satış oluştur, düş, satırları ekle, commit.
+                    with conn.session as db:
+                        # Yeniden onay göndermek aynı işlem numarasıyla ikinci kez stok düşürmemeli.
+                        onceki = db.execute(
+                            text("SELECT id FROM satislar WHERE islem_no = :islem_no"),
+                            {"islem_no": islem_no},
+                        ).scalar_one_or_none()
+                        if onceki is not None:
+                            raise ValueError("Bu satış daha önce kaydedilmiş. Sayfayı yenileyin.")
+
+                        kilitli_urunler = db.execute(
+                            text("SELECT * FROM urunler WHERE id = ANY(:ids) ORDER BY id FOR UPDATE"),
+                            {"ids": sorted(sepet.keys())},
+                        ).mappings().all()
+                        kilitli = {int(r["id"]): dict(r) for r in kilitli_urunler}
+                        if len(kilitli) != len(sepet):
+                            raise ValueError("Sepetteki ürünlerden biri artık bulunmuyor.")
+
+                        kalemler = []
+                        satis_toplami = Decimal("0.00")
+                        for uid, miktar in sorted(sepet.items()):
+                            urun = kilitli[uid]
+                            if int(miktar) <= 0 or int(urun["stok_adedi"]) < int(miktar):
+                                raise ValueError(f"{urun['urun_adi']}: yetersiz stok. Satış iptal edildi.")
+                            birim = urun_satis_fiyati(urun, kurlar)
+                            satir_tutari = para_yuvarla(birim * miktar)
+                            satis_toplami += satir_tutari
+                            kalemler.append((uid, urun, int(miktar), birim, satir_tutari))
+
+                        satis_id = db.execute(
+                            text("INSERT INTO satislar (islem_no, toplam_tl) VALUES (:islem_no, :toplam) RETURNING id"),
+                            {"islem_no": islem_no, "toplam": satis_toplami},
+                        ).scalar_one()
+                        for uid, urun, miktar, birim, satir_tutari in kalemler:
+                            sonuc = db.execute(
+                                text("UPDATE urunler SET stok_adedi = stok_adedi - :miktar WHERE id = :id AND stok_adedi >= :miktar"),
+                                {"id": uid, "miktar": miktar},
+                            )
+                            if sonuc.rowcount != 1:
+                                raise ValueError(f"{urun['urun_adi']} stok düşümü başarısız; satış geri alındı.")
+                            db.execute(
+                                text("""INSERT INTO satis_kalemleri
+                                     (satis_id, urun_id, barkod, urun_adi, miktar, birim_fiyat_tl, satir_toplam_tl)
+                                     VALUES (:satis, :urun, :barkod, :ad, :miktar, :birim, :toplam)"""),
+                                {"satis": satis_id, "urun": uid, "barkod": str(urun.get("barkod") or ""),
+                                 "ad": str(urun["urun_adi"]), "miktar": miktar,
+                                 "birim": birim, "toplam": satir_tutari},
+                            )
+                        db.commit()
+                    sepet.clear()
+                    st.session_state.satis_islem_no = str(uuid.uuid4())
+                    st.session_state.satis_basarili_mesaj = f"Satış #{satis_id} tamamlandı. Toplam: {fiyat_goster(satis_toplami)}. Stoklar düşüldü."
+                    st.rerun()
+                except Exception as hata:
+                    st.error(f"Satış kaydedilemedi, stoklar değiştirilmedi: {hata}")
+        except Exception as hata:
+            st.error(f"Sepet yüklenemedi: {hata}")
+
+    st.markdown("#### Son Satışlar")
+    try:
+        with conn.session as db:
+            son_satislar = db.execute(text("SELECT id, olusturma_zamani, toplam_tl FROM satislar ORDER BY id DESC LIMIT 20")).mappings().all()
+        if son_satislar:
+            st.dataframe(pd.DataFrame([dict(s) for s in son_satislar]), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Henüz satış kaydı yok.")
+    except Exception:
+        st.info("Satış tabloları henüz kurulmamış olabilir. Önce SQL kurulum dosyasını çalıştırın.")
