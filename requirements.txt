@@ -3,4 +3,4 @@ pandas
 requests
 sqlalchemy
 psycopg[binary]
-
+openpyxl
