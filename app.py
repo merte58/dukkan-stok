@@ -774,7 +774,7 @@ if menu in ("➕ Stok Girişi", "➖ Stok Çıkışı"):
         "Stok çıkışı; fire, sayım düzeltmesi gibi satış harici işlemler içindir. "
         "Satış için Barkodlu Satış menüsünü kullanın."
     )
-    st.caption("Stok çıkışı; fire, sayım düzeltmesi gibi satış harici işlemler içindir. Satış için Barkodlu Satış menüsünü kullanın.") if cikis else None
+   
     kamera_kod = kamera_barkod("stok_hareket")
     if kamera_kod is not None:
         st.session_state["stok_islem_barkod"] = kamera_kod
