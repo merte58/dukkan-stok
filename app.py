@@ -769,7 +769,11 @@ if menu == "✏️ Ürün Düzenle/Sil":
 # Yönetim işlemleri: stok girişini tek transaction ve satır kilidi ile uygula.
 if menu in ("➕ Stok Girişi", "➖ Stok Çıkışı"):
     cikis = menu == "➖ Stok Çıkışı"
-    st.subheader("Barkodla Stok " + ("Çıkışı" if cikis else "Girişi"))
+   if cikis:
+    st.caption(
+        "Stok çıkışı; fire, sayım düzeltmesi gibi satış harici işlemler içindir. "
+        "Satış için Barkodlu Satış menüsünü kullanın."
+    )
     st.caption("Stok çıkışı; fire, sayım düzeltmesi gibi satış harici işlemler içindir. Satış için Barkodlu Satış menüsünü kullanın.") if cikis else None
     kamera_kod = kamera_barkod("stok_hareket")
     if kamera_kod is not None:
