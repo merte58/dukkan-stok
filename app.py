@@ -5,10 +5,9 @@ from sqlalchemy import text
 import time
 import uuid
 import re
-import hashlib
 from io import BytesIO
 from PIL import Image, ImageOps
-import zxingcpp
+from streamlit_qrcode_scanner import qrcode_scanner
 from decimal import Decimal, ROUND_HALF_UP
 
 st.set_page_config(page_title="Sinyal Elektrik - Ürün Yönetim Sistemi", layout="wide")
@@ -18,32 +17,31 @@ FOTO_BUCKET = "urun-fotograflari"  # Özel (private) Supabase Storage bucket
 
 
 def kamera_barkod(alan):
-    """Fotoğrafla barkod okur; tek başına satış/stok hareketi YAPMAZ."""
-    with st.expander("📷 Telefon kamerasıyla barkod okut", expanded=False):
-        st.caption("Barkodun tamamı ve çizgileri net görünsün. Fotoğraf çekmek stok değiştirmez.")
-        ac = st.checkbox("Barkod kamerasını aç", key=f"barkod_kamera_ac_{alan}")
-        if not ac:
-            return None
-        foto = st.camera_input("Barkodu fotoğrafla", key=f"barkod_kamera_{alan}")
-        if foto is None:
-            return None
-        ham = foto.getvalue()
-        imza = hashlib.sha256(ham).hexdigest()
-        if st.session_state.get(f"barkod_imza_{alan}") == imza:
-            return None
-        st.session_state[f"barkod_imza_{alan}"] = imza
-        try:
-            img = ImageOps.exif_transpose(Image.open(BytesIO(ham))).convert("RGB")
-            kodlar = list(dict.fromkeys(x.text.strip() for x in zxingcpp.read_barcodes(img) if x.text.strip()))
-            if len(kodlar) == 1:
-                st.success("Barkod okundu: " + kodlar[0])
-                return kodlar[0]
-            if len(kodlar) > 1:
-                st.warning("Birden fazla barkod bulundu. Tek barkodun fotoğrafını çekin.")
-            else:
-                st.warning("Barkod okunamadı. Işığı artırın veya kodu elle girin.")
-        except Exception:
-            st.warning("Fotoğraf çözümlenemedi. Başka bir fotoğraf deneyin.")
+    """Telefonda canlı barkod tarar; kodu bir kez döndürür, stok işlemi yapmaz."""
+    aktif_key = f"canli_tarama_aktif_{alan}"
+    sonuc_key = f"canli_tarama_sonuc_{alan}"
+
+    # Tespit edilen barkod, sonraki Streamlit çalışmasında ilgili arama alanına aktarılır.
+    if sonuc_key in st.session_state:
+        return st.session_state.pop(sonuc_key)
+
+    with st.expander("📷 Canlı barkod okuyucu", expanded=st.session_state.get(aktif_key, False)):
+        st.caption("Barkodu kameraya gösterin. Fotoğraf çekmeniz gerekmez. Barkod okununca kamera kapanır.")
+        if not st.session_state.get(aktif_key, False):
+            if st.button("📷 Barkod okut", key=f"tara_baslat_{alan}", use_container_width=True):
+                st.session_state[aktif_key] = True
+                st.rerun()
+        else:
+            if st.button("Kamerayı kapat", key=f"tara_kapat_{alan}"):
+                st.session_state[aktif_key] = False
+                st.rerun()
+            # HTML5-Qrcode tabanlı bileşen kamerayı tarayıcı içinde açar.
+            # Streamlit uygulaması HTTPS adresi üzerinden kullanılmalıdır.
+            okunan = qrcode_scanner(key=f"canli_okuyucu_{alan}")
+            if okunan and str(okunan).strip():
+                st.session_state[sonuc_key] = str(okunan).strip()
+                st.session_state[aktif_key] = False
+                st.rerun()
     return None
 
 
