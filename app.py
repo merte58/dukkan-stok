@@ -5,6 +5,7 @@ from sqlalchemy import text
 import time
 import uuid
 import re
+import hashlib
 from io import BytesIO
 from PIL import Image, ImageOps, ImageEnhance
 import zxingcpp
