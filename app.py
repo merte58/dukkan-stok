@@ -6,7 +6,8 @@ import time
 import uuid
 import re
 from io import BytesIO
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageEnhance
+import zxingcpp
 from streamlit_qrcode_scanner import qrcode_scanner
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -42,7 +43,52 @@ def kamera_barkod(alan):
                 st.session_state[sonuc_key] = str(okunan).strip()
                 st.session_state[aktif_key] = False
                 st.rerun()
+
+        # Canlı bileşen bazı telefonlarda 1D/EAN-13 barkodlarını algılamayabilir.
+        # Yedek okuyucu fotoğraf karesi üzerinden ZXing-C++ ile sunucuda çözümler.
+        with st.expander("Çizgili barkod okunmuyorsa: fotoğrafla tara", expanded=False):
+            st.caption("Kamerayı 15–25 cm uzakta tutun. Barkodu yatay, net ve iki kenarı boş kalacak şekilde çekin. Fotoğraf sadece kodu çözmek için kullanılır.")
+            kare = st.camera_input("Barkod fotoğrafı çek", key=f"yedek_kamera_{alan}")
+            if kare is not None:
+                parmakizi = hashlib.sha256(kare.getvalue()).hexdigest()
+                onceki = f"yedek_kamera_ozet_{alan}"
+                if st.session_state.get(onceki) != parmakizi:
+                    st.session_state[onceki] = parmakizi
+                    try:
+                        barkodlar = fotograf_barkod_oku(kare.getvalue())
+                        if len(barkodlar) == 1:
+                            st.session_state[sonuc_key] = barkodlar[0]
+                            st.session_state[aktif_key] = False
+                            st.rerun()
+                        elif len(barkodlar) > 1:
+                            st.warning("Birden fazla barkod bulundu. Tek ürün barkodu çekin.")
+                        else:
+                            st.warning("Barkod çözümlenemedi. Daha fazla ışık, net odak ve biraz mesafe deneyin.")
+                    except Exception:
+                        st.warning("Fotoğraf işlenemedi. Barkodu elle girebilirsiniz.")
     return None
+
+
+def fotograf_barkod_oku(ham):
+    """Yalnızca fotoğraf karesini ZXing ile çözer, hiçbir stok/satış işlemi yapmaz."""
+    if len(ham) > 12 * 1024 * 1024:
+        raise ValueError("Fotoğraf 12 MB sınırını aşıyor.")
+    resim = ImageOps.exif_transpose(Image.open(BytesIO(ham))).convert("RGB")
+    if resim.width * resim.height > 20_000_000:
+        resim.thumbnail((4000, 4000))
+    goruntuler = [resim]
+    gri = ImageOps.grayscale(resim)
+    goruntuler.append(gri)
+    goruntuler.append(ImageEnhance.Contrast(gri).enhance(1.8))
+    kodlar = []
+    for im in goruntuler:
+        for sonuc in zxingcpp.read_barcodes(im):
+            kod = (sonuc.text or "").strip()
+            if kod and kod not in kodlar:
+                kodlar.append(kod)
+        if kodlar:
+            break
+    return kodlar
 
 
 def urun_fotograf_sec(alan):
@@ -101,6 +147,69 @@ def foto_yukle(foto, urun_id):
     if yanit.status_code not in (200, 201):
         raise RuntimeError(f"Fotoğraf yüklenemedi (HTTP {yanit.status_code}). Özel Storage bucket ve RLS kurulumunu kontrol edin.")
     return dosya_yolu
+
+
+@st.cache_data(ttl=300, show_spinner=False, max_entries=350)
+def foto_onizleme(foto_yolu, access_token, boyut=240):
+    """Özel Storage'dan fotoğrafı yalnızca oturum sahibi token ile okur; küçük görsele çevirir."""
+    from urllib.parse import quote
+    if not isinstance(foto_yolu, str) or not foto_yolu.strip():
+        return None
+    base = st.secrets["supabase_auth"]["url"].rstrip("/")
+    adres = f"{base}/storage/v1/object/authenticated/{FOTO_BUCKET}/{quote(foto_yolu, safe='/')}"
+    yanit = requests.get(adres, headers={"apikey": st.secrets["supabase_auth"]["anon_key"],
+                                       "Authorization": f"Bearer {access_token}"}, timeout=12)
+    if yanit.status_code != 200 or not yanit.headers.get("content-type", "").startswith("image/"):
+        return None
+    if len(yanit.content) > 4 * 1024 * 1024:
+        return None
+    resim = ImageOps.exif_transpose(Image.open(BytesIO(yanit.content))).convert("RGB")
+    resim.thumbnail((boyut, boyut))
+    hedef = BytesIO()
+    resim.save(hedef, format="JPEG", quality=75, optimize=True)
+    return hedef.getvalue()
+
+
+def fotograflı_kartlar(urunler, kurlar):
+    """Filtrelenmiş ürünleri 12'şerli sayfalarda gösterir; her karta sadece satış fiyatını koyar."""
+    if urunler.empty:
+        return
+    st.markdown("#### Fotoğraflı ürünler")
+    st.caption("Her sayfada en fazla 12 küçük fotoğraf yüklenir. Fotoğrafı olmayan ürünlerde bilgi kartı görünür.")
+    son_sayfa = max(1, (len(urunler) + 11) // 12)
+    sayfa = st.number_input("Sayfa", min_value=1, max_value=son_sayfa, value=1, step=1, key="urun_foto_sayfa")
+    alt = (sayfa - 1) * 12
+    parcali = urunler.iloc[alt:alt + 12]
+    for i in range(0, len(parcali), 3):
+        sutunlar = st.columns(3)
+        for sutun, (_, urun) in zip(sutunlar, parcali.iloc[i:i+3].iterrows()):
+            with sutun:
+                with st.container(border=True):
+                    yol = urun.get("foto_yolu")
+                    if isinstance(yol, str) and yol.strip():
+                        try:
+                            goruntu = foto_onizleme(yol, st.session_state.auth_access_token)
+                            if goruntu is not None:
+                                st.image(goruntu, use_container_width=True)
+                            else:
+                                st.caption("Fotoğraf yüklenemedi")
+                        except (requests.RequestException, OSError, ValueError):
+                            st.caption("Fotoğraf görüntülenemiyor")
+                    else:
+                        st.caption("Fotoğraf eklenmemiş")
+                    st.markdown(f"**{str(urun.get('urun_adi', 'Ürün'))}**")
+                    st.caption(f"Barkod: {str(urun.get('barkod', '')).strip()} | Raf: {str(urun.get('raf_konumu', ''))}")
+                    st.write(f"Stok: **{int(urun.get('stok_adedi', 0))}**")
+                    try:
+                        kur = Decimal(str(kurlar.get(str(urun.get("para_birimi", "TRY")), 1)))
+                        liste = Decimal(str(urun.get("liste_fiyati", 0)))
+                        iskonto = Decimal(str(urun.get("tedarikci_iskonto", 0)))
+                        kar = Decimal(str(urun.get("kar_marji", 0)))
+                        kdv = Decimal(str(urun.get("kdv_orani", 0)))
+                        fiyat = (liste * (1 - iskonto / 100) * kur * (1 + kar / 100) * (1 + kdv / 100)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                        st.write(f"Satış fiyatı: **{fiyat:,.2f} TL**")
+                    except Exception:
+                        st.caption("Fiyat hesaplanamadı")
 
 
 def foto_goster(foto_yolu, genislik=230):
@@ -404,6 +513,7 @@ if is_admin and menu == "📥 Katalog Yükle":
 if menu == "📦 Stok ve Fiyat Sorgula":
     st.subheader("Dükkan Stok & Satış Fiyatları")
     df = get_dukkan_data()
+    ham_urunler = df.copy()
     camera_value = kamera_barkod("stok_sorgula")
     if camera_value is not None:
         st.session_state["stok_arama_kodu"] = camera_value
@@ -488,9 +598,22 @@ if menu == "📦 Stok ve Fiyat Sorgula":
     else:
         st.info("Dükkanda henüz kayıtlı ürün yok.")
     if not df.empty and camera_value:
-        gorsel = df[df["barkod"].astype(str).str.strip() == camera_value]
+        barkod_kaynak = ham_urunler
+        gorsel = barkod_kaynak[barkod_kaynak["barkod"].astype(str).str.strip() == camera_value]
         if len(gorsel) == 1:
             foto_goster(gorsel.iloc[0].get("foto_yolu"))
+
+    # Her kullanıcının yalnızca satış fiyatını görebileceği resimli liste.
+    # Ham kayıtlar kartlara yalnızca sunucu tarafında işlenmek üzere aktarılır.
+    if not ham_urunler.empty:
+        filtre_kodu = st.session_state.get("stok_arama_kodu", "").strip()
+        gorunen_urunler = ham_urunler
+        if filtre_kodu:
+            maske = (gorunen_urunler["urun_adi"].astype(str).str.contains(filtre_kodu, case=False, na=False, regex=False) |
+                     gorunen_urunler["barkod"].astype(str).str.contains(filtre_kodu, case=False, na=False, regex=False) |
+                     gorunen_urunler["raf_konumu"].astype(str).str.contains(filtre_kodu, case=False, na=False, regex=False))
+            gorunen_urunler = gorunen_urunler.loc[maske]
+        fotograflı_kartlar(gorunen_urunler, kurlar)
 
 # ----------------------------------------------------
 # 4. SEKME: DÜKKANA ÜRÜN EKLE
