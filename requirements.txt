@@ -6,3 +6,4 @@ psycopg[binary]
 openpyxl
 Pillow
 streamlit-qrcode-scanner==0.1.2
+zxing-cpp
