@@ -5,4 +5,4 @@ sqlalchemy
 psycopg[binary]
 openpyxl
 Pillow
-zxing-cpp
+streamlit-qrcode-scanner==0.1.2
