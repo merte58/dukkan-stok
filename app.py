@@ -5,9 +5,121 @@ from sqlalchemy import text
 import time
 import uuid
 import re
+import hashlib
+from io import BytesIO
+from PIL import Image, ImageOps
+import zxingcpp
 from decimal import Decimal, ROUND_HALF_UP
 
 st.set_page_config(page_title="Sinyal Elektrik - Ürün Yönetim Sistemi", layout="wide")
+
+# --- Mobil barkod okuma ve ürün görselleri ---
+FOTO_BUCKET = "urun-fotograflari"  # Özel (private) Supabase Storage bucket
+
+
+def kamera_barkod(alan):
+    """Fotoğrafla barkod okur; tek başına satış/stok hareketi YAPMAZ."""
+    with st.expander("📷 Telefon kamerasıyla barkod okut", expanded=False):
+        st.caption("Barkodun tamamı ve çizgileri net görünsün. Fotoğraf çekmek stok değiştirmez.")
+        ac = st.checkbox("Barkod kamerasını aç", key=f"barkod_kamera_ac_{alan}")
+        if not ac:
+            return None
+        foto = st.camera_input("Barkodu fotoğrafla", key=f"barkod_kamera_{alan}")
+        if foto is None:
+            return None
+        ham = foto.getvalue()
+        imza = hashlib.sha256(ham).hexdigest()
+        if st.session_state.get(f"barkod_imza_{alan}") == imza:
+            return None
+        st.session_state[f"barkod_imza_{alan}"] = imza
+        try:
+            img = ImageOps.exif_transpose(Image.open(BytesIO(ham))).convert("RGB")
+            kodlar = list(dict.fromkeys(x.text.strip() for x in zxingcpp.read_barcodes(img) if x.text.strip()))
+            if len(kodlar) == 1:
+                st.success("Barkod okundu: " + kodlar[0])
+                return kodlar[0]
+            if len(kodlar) > 1:
+                st.warning("Birden fazla barkod bulundu. Tek barkodun fotoğrafını çekin.")
+            else:
+                st.warning("Barkod okunamadı. Işığı artırın veya kodu elle girin.")
+        except Exception:
+            st.warning("Fotoğraf çözümlenemedi. Başka bir fotoğraf deneyin.")
+    return None
+
+
+def urun_fotograf_sec(alan):
+    """Ürün fotoğrafı kameradan veya galeriden alınır; ancak Kaydet ile yüklenir."""
+    with st.expander("🖼️ Ürün fotoğrafı ekle / değiştir", expanded=False):
+        sec = st.radio("Kaynak", ["Galeriden / dosyadan", "Kameradan çek"], key=f"fotok_{alan}", horizontal=True)
+        foto = (st.file_uploader("Ürün fotoğrafı seç (JPG/PNG/WEBP)", type=["jpg", "jpeg", "png", "webp"], key=f"fotou_{alan}")
+                if sec == "Galeriden / dosyadan" else
+                st.camera_input("Ürünün fotoğrafını çek", key=f"fotoc_{alan}"))
+        if foto is not None:
+            st.image(foto, width=220)
+        return foto
+
+
+def fotograf_hazirla(foto):
+    """Özel depoya gitmeden önce boyutları küçültüp JPEG'e dönüştürür."""
+    try:
+        ham = foto.getvalue()
+        if len(ham) > 12 * 1024 * 1024:
+            raise ValueError("Fotoğraf 12 MB'den büyük olmamalı.")
+        im = ImageOps.exif_transpose(Image.open(BytesIO(ham)))
+        im.thumbnail((1200, 1200))
+        if im.mode in ("RGBA", "LA"):
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im, mask=im.getchannel("A"))
+            im = bg
+        else:
+            im = im.convert("RGB")
+        b = BytesIO()
+        im.save(b, format="JPEG", quality=77, optimize=True)
+        data = b.getvalue()
+        if len(data) > 1024 * 1024:
+            raise ValueError("Sıkıştırılmış fotoğraf 1 MB sınırını aşıyor.")
+        return data
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Fotoğraf hazırlanamadı: {exc}") from exc
+
+
+def storage_basliklari():
+    return {"apikey": st.secrets["supabase_auth"]["anon_key"],
+            "Authorization": f"Bearer {st.session_state.auth_access_token}"}
+
+
+def foto_yukle(foto, urun_id):
+    """Benzersiz yeni isimle yükler; var olan fotoğrafa overwrite yapmaz."""
+    if foto is None:
+        return None
+    veri = fotograf_hazirla(foto)
+    dosya_yolu = f"urun-{int(urun_id)}/{uuid.uuid4().hex}.jpg"
+    url = st.secrets["supabase_auth"]["url"].rstrip("/")
+    from urllib.parse import quote
+    tam_url = f"{url}/storage/v1/object/{FOTO_BUCKET}/{quote(dosya_yolu, safe='/')}"
+    baslik = storage_basliklari()
+    baslik["Content-Type"] = "image/jpeg"
+    yanit = requests.post(tam_url, headers=baslik, data=veri, timeout=35)
+    if yanit.status_code not in (200, 201):
+        raise RuntimeError(f"Fotoğraf yüklenemedi (HTTP {yanit.status_code}). Özel Storage bucket ve RLS kurulumunu kontrol edin.")
+    return dosya_yolu
+
+
+def foto_goster(foto_yolu, genislik=230):
+    if not isinstance(foto_yolu, str) or not foto_yolu.strip():
+        return
+    from urllib.parse import quote
+    url = st.secrets["supabase_auth"]["url"].rstrip("/")
+    tam_url = f"{url}/storage/v1/object/authenticated/{FOTO_BUCKET}/{quote(foto_yolu, safe='/')}"
+    try:
+        yanit = requests.get(tam_url, headers=storage_basliklari(), timeout=12)
+        if yanit.status_code == 200 and yanit.headers.get("content-type", "").startswith("image/"):
+            st.image(yanit.content, width=genislik)
+        else:
+            st.caption("Ürün fotoğrafı görüntülenemedi.")
+    except requests.RequestException:
+        st.caption("Fotoğraf bağlantısı kurulamadı.")
+
 
 # PostgreSQL kimlik bilgileri yalnızca Streamlit Secrets içinde tutulur.
 conn = st.connection("postgresql", type="sql")
@@ -79,7 +191,7 @@ is_admin = kullanici["rol"] == "admin"
 with st.sidebar:
     st.title("⚡ Sinyal Elektrik")
     st.caption(f"{kullanici['email']} | {'Yönetici' if is_admin else 'Personel'}")
-    menu_items = ["🏠 Ana Sayfa", "🛒 Barkodlu Satış", "📦 Stok ve Fiyat Sorgula", "➕ Stok Girişi", "↩️ Satış İptali", "✏️ Ürün Düzenle/Sil"]
+    menu_items = ["🏠 Ana Sayfa", "🛒 Barkodlu Satış", "📦 Stok ve Fiyat Sorgula", "➕ Stok Girişi", "➖ Stok Çıkışı", "↩️ Satış İptali", "✏️ Ürün Düzenle/Sil"]
     if is_admin:
         menu_items += ["📊 Satış Raporları", "📖 Katalog", "📥 Katalog Yükle", "🆕 Ürün Ekle"]
     menu = st.radio("İşlemler", menu_items, label_visibility="collapsed")
@@ -92,7 +204,7 @@ with st.sidebar:
 # Veri Çekme Fonksiyonları
 def get_dukkan_data():
     try:
-        sorgu = "SELECT * FROM urunler ORDER BY id DESC;" if is_admin else "SELECT id, barkod, urun_adi, raf_konumu, stok_adedi, liste_fiyati, para_birimi, tedarikci_iskonto, kar_marji, kdv_orani FROM urunler ORDER BY id DESC;"
+        sorgu = "SELECT * FROM urunler ORDER BY id DESC;" if is_admin else "SELECT id, barkod, urun_adi, raf_konumu, stok_adedi, liste_fiyati, para_birimi, tedarikci_iskonto, kar_marji, kdv_orani, foto_yolu FROM urunler ORDER BY id DESC;"
         return conn.query(sorgu, ttl="0s")
     except Exception:
         return pd.DataFrame()
@@ -142,7 +254,7 @@ if menu == "🏠 Ana Sayfa":
     c1, c2 = st.columns(2)
     c1.metric("Ürün çeşidi", int(urun_sayisi))
     c2.metric("Toplam stok (birim)", int(toplam_stok))
-    st.info("Soldaki menüden Barkodlu Satış, Stok Sorgulama veya Stok Girişi'ni seçin. Mobil cihazlarda menüyü sol üstten açabilirsiniz.")
+    st.info("Soldaki menüden Barkodlu Satış, Stok Sorgulama, Stok Girişi veya Stok Çıkışı'nı seçin. Mobil cihazlarda menüyü sol üstten açabilirsiniz.")
     if is_admin:
         st.caption("Yönetici panelinde maliyetler, kataloglar, satış raporları ve personel yetkileri yönetilir.")
 
@@ -294,6 +406,9 @@ if is_admin and menu == "📥 Katalog Yükle":
 if menu == "📦 Stok ve Fiyat Sorgula":
     st.subheader("Dükkan Stok & Satış Fiyatları")
     df = get_dukkan_data()
+    camera_value = kamera_barkod("stok_sorgula")
+    if camera_value is not None:
+        st.session_state["stok_arama_kodu"] = camera_value
 
     if not is_admin and not df.empty:
         # Hesaplama sunucu tarafında yapılır; maliyet ve kâr kolonları kullanıcıya iletilmez.
@@ -309,11 +424,13 @@ if menu == "📦 Stok ve Fiyat Sorgula":
                 return None
         df["Satış Fiyatı (TL)"] = df.apply(gorunen_fiyat, axis=1)
         df = df.rename(columns={"barkod": "Barkod", "urun_adi": "Ürün Adı", "raf_konumu": "Raf", "stok_adedi": "Stok"})
-        filtre = st.text_input("Ürün adı veya barkod ara", key="staff_stock_search")
+        filtre = st.text_input("Ürün adı veya barkod ara", key="stok_arama_kodu")
         if filtre:
             df = df[df["Ürün Adı"].astype(str).str.contains(filtre, case=False, na=False, regex=False) |
                     df["Barkod"].astype(str).str.contains(filtre, case=False, na=False, regex=False)]
         st.dataframe(df[["Barkod", "Ürün Adı", "Raf", "Stok", "Satış Fiyatı (TL)"]], hide_index=True, use_container_width=True)
+        if len(df) == 1 and filtre.strip():
+            foto_goster(df.iloc[0].get("foto_yolu"))
     elif not is_admin:
         st.info("Ürün kaydı bulunmuyor.")
     elif not df.empty and "urun_adi" in df.columns:
@@ -351,7 +468,7 @@ if menu == "📦 Stok ve Fiyat Sorgula":
             "Nihai Satış (KDV Dahil)": "Etiket Fiyatı (₺)"
         })
 
-        arama = st.text_input("🔍 Dükkan Ürünlerinde Arama Yapın")
+        arama = st.text_input("🔍 Dükkan Ürünlerinde Arama Yapın", key="stok_arama_kodu")
         if arama:
             gosterilecek_tablo = gosterilecek_tablo[
                 gosterilecek_tablo["Ürün Adı"].astype(str).str.contains(arama, case=False, na=False) |
@@ -360,6 +477,8 @@ if menu == "📦 Stok ve Fiyat Sorgula":
             ]
 
         st.dataframe(gosterilecek_tablo, use_container_width=True, hide_index=True)
+        if len(gosterilecek_tablo) == 1 and arama.strip():
+            foto_goster(df.loc[df["id"] == int(gosterilecek_tablo.iloc[0]["ID"])].iloc[0].get("foto_yolu"))
 
         csv_data = gosterilecek_tablo.to_csv(index=False).encode('utf-8-sig')
         st.download_button(
@@ -370,15 +489,23 @@ if menu == "📦 Stok ve Fiyat Sorgula":
         )
     else:
         st.info("Dükkanda henüz kayıtlı ürün yok.")
+    if not df.empty and camera_value:
+        gorsel = df[df["barkod"].astype(str).str.strip() == camera_value]
+        if len(gorsel) == 1:
+            foto_goster(gorsel.iloc[0].get("foto_yolu"))
 
 # ----------------------------------------------------
 # 4. SEKME: DÜKKANA ÜRÜN EKLE
 # ----------------------------------------------------
 if is_admin and menu == "🆕 Ürün Ekle":
     st.subheader("Dükkana Yeni Stok / Ürün Kaydı")
+    kamera_kod = kamera_barkod("yeni_urun")
+    if kamera_kod is not None:
+        st.session_state["yeni_barkod"] = kamera_kod
+    yeni_foto = urun_fotograf_sec("yeni_urun")
     with st.form("yeni_dukkan_urun_form", clear_on_submit=True):
         col_a, col_b = st.columns(2)
-        barkod = col_a.text_input("Barkod / Stok Kodu")
+        barkod = col_a.text_input("Barkod / Stok Kodu", key="yeni_barkod")
         urun_adi = col_b.text_input("Ürün Adı")
         raf_konumu = st.text_input("Dükkan Konumu / Raf (Örn: Raf A-3, Pano Yanı, Çekmece 2)")
         
@@ -399,10 +526,10 @@ if is_admin and menu == "🆕 Ürün Ekle":
         if kaydet:
             if urun_adi:
                 with conn.session as s:
-                    s.execute(
+                    yeni_id = s.execute(
                         text("""
                             INSERT INTO urunler (barkod, urun_adi, raf_konumu, liste_fiyati, para_birimi, tedarikci_iskonto, kar_marji, kdv_orani, stok_adedi)
-                            VALUES (:barkod, :urun_adi, :raf_konumu, :liste_fiyati, :para_birimi, :tedarikci_iskonto, :kar_marji, :kdv_orani, :stok_adedi)
+                            VALUES (:barkod, :urun_adi, :raf_konumu, :liste_fiyati, :para_birimi, :tedarikci_iskonto, :kar_marji, :kdv_orani, :stok_adedi) RETURNING id
                         """),
                         {
                             "barkod": str(barkod),
@@ -416,7 +543,16 @@ if is_admin and menu == "🆕 Ürün Ekle":
                             "stok_adedi": int(stok_adedi)
                         }
                     )
+                    yeni_id = yeni_id.scalar_one()
                     s.commit()
+                if yeni_foto is not None:
+                    try:
+                        yeni_yol = foto_yukle(yeni_foto, yeni_id)
+                        with conn.session as s:
+                            s.execute(text("UPDATE urunler SET foto_yolu=:f WHERE id=:i"), {"f":yeni_yol,"i":int(yeni_id)})
+                            s.commit()
+                    except Exception as exc:
+                        st.warning(f"Ürün kaydedildi ama fotoğraf yüklenemedi: {exc}")
                 st.success(f"'{urun_adi}' dükkan stoğuna başarıyla eklendi!")
                 st.rerun()
             else:
@@ -436,7 +572,8 @@ if menu == "✏️ Ürün Düzenle/Sil":
         secilen_etiket = st.selectbox("Düzenlenecek Ürünü Seçin:", list(secenekler.keys()))
         secilen_id = secenekler[secilen_etiket]
         secilen_urun = df_duzenle[df_duzenle["id"] == secilen_id].iloc[0]
-
+        foto_goster(secilen_urun.get("foto_yolu"))
+        degisen_foto = urun_fotograf_sec(f"duzenle_{secilen_id}")
         with st.form("duzenle_form"):
             col_d1, col_d2 = st.columns(2)
             d_barkod = col_d1.text_input("Barkod / Stok Kodu", value=str(secilen_urun.get("barkod", "") or ""))
@@ -485,6 +622,11 @@ if menu == "✏️ Ürün Düzenle/Sil":
                                     raf_konumu=:raf WHERE id=:id"""),
                                     {"barkod":d_barkod.strip(), "ad":d_urun_adi.strip(), "raf":d_raf.strip(), "id":int(secilen_id)})
                             db.commit()
+                        if degisen_foto is not None:
+                            yeni_yol = foto_yukle(degisen_foto, int(secilen_id))
+                            with conn.session as db:
+                                db.execute(text("UPDATE urunler SET foto_yolu=:f WHERE id=:id"), {"f":yeni_yol,"id":int(secilen_id)})
+                                db.commit()
                         st.success("Ürün bilgileri güncellendi.")
                         st.rerun()
                     except Exception as exc:
@@ -503,26 +645,41 @@ if menu == "✏️ Ürün Düzenle/Sil":
         st.info("Düzenlenecek dükkan ürünü bulunmuyor.")
 
 # Yönetim işlemleri: stok girişini tek transaction ve satır kilidi ile uygula.
-if menu == "➕ Stok Girişi":
-    st.subheader("Barkodla Stok Girişi")
-    with st.form("stok_giris_form", clear_on_submit=True):
-        kod = st.text_input("Barkod / Stok Kodu")
-        adet = st.number_input("Gelen miktar", min_value=1, step=1, value=1)
-        notlar = st.text_input("Açıklama (isteğe bağlı)")
-        kaydet = st.form_submit_button("Stoğa Ekle", use_container_width=True)
+if menu in ("➕ Stok Girişi", "➖ Stok Çıkışı"):
+    cikis = menu == "➖ Stok Çıkışı"
+    st.subheader("Barkodla Stok " + ("Çıkışı" if cikis else "Girişi"))
+    st.caption("Stok çıkışı; fire, sayım düzeltmesi gibi satış harici işlemler içindir. Satış için Barkodlu Satış menüsünü kullanın.") if cikis else None
+    kamera_kod = kamera_barkod("stok_hareket")
+    if kamera_kod is not None:
+        st.session_state["stok_islem_barkod"] = kamera_kod
+    with st.form("stok_hareket_form", clear_on_submit=False):
+        kod = st.text_input("Barkod / Stok Kodu", key="stok_islem_barkod")
+        adet = st.number_input("Miktar", min_value=1, step=1, value=1)
+        notlar = st.text_input("İşlem nedeni / açıklama", key="hareket_notu")
+        onay = st.checkbox("Stoktan düşümü onaylıyorum") if cikis else True
+        kaydet = st.form_submit_button("Stoktan Çıkar" if cikis else "Stoğa Ekle", use_container_width=True)
     if kaydet:
-        try:
-            with conn.session as db:
-                bulunan = db.execute(text("SELECT id, urun_adi FROM urunler WHERE BTRIM(barkod)=:b FOR UPDATE"), {"b":kod.strip()}).mappings().all()
-                if len(bulunan) != 1:
-                    raise ValueError("Barkod bulunamadı veya birden fazla ürüne kayıtlı.")
-                u = bulunan[0]
-                db.execute(text("UPDATE urunler SET stok_adedi=stok_adedi+:a WHERE id=:id"), {"a":int(adet),"id":u["id"]})
-                db.execute(text("INSERT INTO public.stok_hareketleri (urun_id, miktar, islem_tipi, aciklama, yapan_user_id) VALUES (:id,:a,'giris',:n,:uid)"), {"id":u["id"],"a":int(adet),"n":notlar,"uid":kullanici["id"]})
-                db.commit()
-            st.success(f"{u['urun_adi']}: +{adet} adet eklendi.")
-        except Exception as exc:
-            st.error(f"Stok girişi başarısız: {exc}")
+        if cikis and (not onay or not notlar.strip()):
+            st.error("Çıkış için neden yazılması ve onay verilmesi gerekir.")
+        else:
+            try:
+                with conn.session as db:
+                    bulunan = db.execute(text("SELECT id, urun_adi, stok_adedi, foto_yolu FROM urunler WHERE BTRIM(barkod)=:b FOR UPDATE"), {"b":kod.strip()}).mappings().all()
+                    if len(bulunan) != 1:
+                        raise ValueError("Barkod bulunamadı veya birden fazla ürüne kayıtlı.")
+                    u = bulunan[0]
+                    if cikis:
+                        sonuc = db.execute(text("UPDATE urunler SET stok_adedi=stok_adedi-:a WHERE id=:id AND stok_adedi>=:a"), {"a":int(adet),"id":u["id"]})
+                        if sonuc.rowcount != 1:
+                            raise ValueError("Yetersiz stok. İşlem kaydedilmedi.")
+                    else:
+                        db.execute(text("UPDATE urunler SET stok_adedi=stok_adedi+:a WHERE id=:id"), {"a":int(adet),"id":u["id"]})
+                    db.execute(text("INSERT INTO public.stok_hareketleri (urun_id, miktar, islem_tipi, aciklama, yapan_user_id) VALUES (:id,:a,:t,:n,:uid)"), {"id":u["id"],"a":int(adet),"t":"cikis" if cikis else "giris","n":notlar.strip(),"uid":kullanici["id"]})
+                    db.commit()
+                st.success(f"{u['urun_adi']}: {'-' if cikis else '+'}{adet} adet işlendi.")
+                foto_goster(u.get("foto_yolu"))
+            except Exception as exc:
+                st.error(f"Stok işlemi başarısız: {exc}")
 
 if is_admin and menu == "📊 Satış Raporları":
     st.subheader("Satış Raporları")
@@ -608,8 +765,11 @@ if menu == "🛒 Barkodlu Satış":
     if st.session_state.get("satis_basarili_mesaj"):
         st.success(st.session_state.pop("satis_basarili_mesaj"))
     st.caption("Barkod okuyucuyla okutun veya barkodu elle girin. Sorgulama stoktan düşmez; stok sadece satış onayında düşer.")
-    with st.form("barkod_okut_form", clear_on_submit=True):
-        barkod_sorgu = st.text_input("Barkod / Stok Kodu", placeholder="Barkodu okutun (Enter)")
+    kamera_kod = kamera_barkod("satis")
+    if kamera_kod is not None:
+        st.session_state["satis_kodu"] = kamera_kod
+    with st.form("barkod_okut_form", clear_on_submit=False):
+        barkod_sorgu = st.text_input("Barkod / Stok Kodu", placeholder="Barkodu okutun veya kamerayla fotoğraf çekin", key="satis_kodu")
         eklenecek_adet = st.number_input("Sepete eklenecek adet", min_value=1, value=1, step=1)
         barkod_ara = st.form_submit_button("🔎 Sorgula ve Sepete Ekle", use_container_width=True)
 
@@ -634,6 +794,7 @@ if menu == "🛒 Barkodlu Satış":
                     mevcut = int(urun["stok_adedi"])
                     sepetteki = st.session_state.satis_sepeti.get(urun_id, 0)
                     st.info(f"{urun['urun_adi']} | Raf: {urun.get('raf_konumu') or '-'} | Stok: {mevcut} | Fiyat: {fiyat_goster(urun_satis_fiyati(urun, kurlar))}")
+                    foto_goster(urun.get("foto_yolu"))
                     if sepetteki + int(eklenecek_adet) > mevcut:
                         st.error("Yetersiz stok: sepetteki miktar da hesaba katıldı.")
                     else:
