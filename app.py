@@ -45,28 +45,44 @@ def kamera_barkod(alan):
                 st.session_state[aktif_key] = False
                 st.rerun()
 
-        # Canlı bileşen bazı telefonlarda 1D/EAN-13 barkodlarını algılamayabilir.
-        # Yedek okuyucu fotoğraf karesi üzerinden ZXing-C++ ile sunucuda çözümler.
-        with st.expander("Çizgili barkod okunmuyorsa: fotoğrafla tara", expanded=False):
-            st.caption("Kamerayı 15–25 cm uzakta tutun. Barkodu yatay, net ve iki kenarı boş kalacak şekilde çekin. Fotoğraf sadece kodu çözmek için kullanılır.")
-            kare = st.camera_input("Barkod fotoğrafı çek", key=f"yedek_kamera_{alan}")
+        # Canlı okuyucu başarısız olursa yüksek çözünürlüklü fotoğrafı yükleyerek çöz.
+        with st.expander("📷 Fotoğrafla / galeriden barkod tara", expanded=False):
+            st.caption("Canlı tarama başarısızsa telefonun normal kamerasında net fotoğraf çekip galeriden yükleyebilirsiniz. Fotoğraf sadece kodu okumak için kullanılır; stok değişmez.")
+            fotograf_kaynagi = st.radio(
+                "Barkod fotoğrafının kaynağı",
+                ["Galeriden fotoğraf seç", "Site kamerasıyla fotoğraf çek"],
+                horizontal=True,
+                key=f"yedek_kaynak_{alan}",
+            )
+            if fotograf_kaynagi == "Galeriden fotoğraf seç":
+                kare = st.file_uploader(
+                    "Telefon galerisinden barkod fotoğrafını yükle (JPG / PNG / WEBP)",
+                    type=["jpg", "jpeg", "png", "webp"],
+                    key=f"yedek_galeri_{alan}",
+                )
+            else:
+                kare = st.camera_input("Barkod fotoğrafı çek", key=f"yedek_kamera_{alan}")
             if kare is not None:
-                parmakizi = hashlib.sha256(kare.getvalue()).hexdigest()
+                ham = kare.getvalue()
+                # Aynı resim Streamlit yeniden çalıştığında tekrar çözülmesin.
+                parmakizi = hashlib.sha256(ham).hexdigest()
                 onceki = f"yedek_kamera_ozet_{alan}"
                 if st.session_state.get(onceki) != parmakizi:
                     st.session_state[onceki] = parmakizi
                     try:
-                        barkodlar = fotograf_barkod_oku(kare.getvalue())
+                        barkodlar = fotograf_barkod_oku(ham)
                         if len(barkodlar) == 1:
                             st.session_state[sonuc_key] = barkodlar[0]
                             st.session_state[aktif_key] = False
                             st.rerun()
                         elif len(barkodlar) > 1:
-                            st.warning("Birden fazla barkod bulundu. Tek ürün barkodu çekin.")
+                            st.warning("Birden fazla barkod bulundu. Tek ürün barkodunun fotoğrafını yükleyin.")
                         else:
-                            st.warning("Barkod çözümlenemedi. Daha fazla ışık, net odak ve biraz mesafe deneyin.")
+                            st.warning("Barkod algılanamadı. Normal kamerayla net fotoğraf çekin; barkodun tüm çizgileri ve iki yanındaki boşluklar kadrajda olsun.")
+                    except (ValueError, OSError) as exc:
+                        st.warning(f"Fotoğraf işlenemedi: {exc}")
                     except Exception:
-                        st.warning("Fotoğraf işlenemedi. Barkodu elle girebilirsiniz.")
+                        st.warning("Barkod çözümlenemedi. Farklı bir fotoğraf deneyin veya kodu elle girin.")
     return None
 
 
@@ -769,12 +785,9 @@ if menu == "✏️ Ürün Düzenle/Sil":
 # Yönetim işlemleri: stok girişini tek transaction ve satır kilidi ile uygula.
 if menu in ("➕ Stok Girişi", "➖ Stok Çıkışı"):
     cikis = menu == "➖ Stok Çıkışı"
-   if cikis:
-    st.caption(
-        "Stok çıkışı; fire, sayım düzeltmesi gibi satış harici işlemler içindir. "
-        "Satış için Barkodlu Satış menüsünü kullanın."
-    )
-   
+    st.subheader("Barkodla Stok " + ("Çıkışı" if cikis else "Girişi"))
+    if cikis:
+        st.caption("Stok çıkışı; fire, sayım düzeltmesi gibi satış harici işlemler içindir. Satış için Barkodlu Satış menüsünü kullanın.")
     kamera_kod = kamera_barkod("stok_hareket")
     if kamera_kod is not None:
         st.session_state["stok_islem_barkod"] = kamera_kod
