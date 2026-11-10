@@ -4,3 +4,5 @@ requests
 sqlalchemy
 psycopg[binary]
 openpyxl
+Pillow
+zxing-cpp
