@@ -1,9 +1,11 @@
-streamlit
+streamlit>=1.50,<2
 pandas
 requests
-sqlalchemy
+sqlalchemy>=2,<3
 psycopg[binary]
 openpyxl
 Pillow
 streamlit-qrcode-scanner==0.1.2
 zxing-cpp
+pdfplumber>=0.11,<1
+PyMuPDF>=1.24,<2

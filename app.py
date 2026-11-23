@@ -11,6 +11,7 @@ from PIL import Image, ImageOps, ImageEnhance
 import zxingcpp
 from streamlit_qrcode_scanner import qrcode_scanner
 from decimal import Decimal, ROUND_HALF_UP
+from katalog_ui import render_catalogue
 
 st.set_page_config(page_title="Sinyal Elektrik - Ürün Yönetim Sistemi", layout="wide")
 
@@ -218,7 +219,7 @@ def fotograflı_kartlar(urunler, kurlar):
                     st.caption(f"Barkod: {str(urun.get('barkod', '')).strip()} | Raf: {str(urun.get('raf_konumu', ''))}")
                     st.write(f"Stok: **{int(urun.get('stok_adedi', 0))}**")
                     try:
-                        kur = Decimal(str(kurlar.get(str(urun.get("para_birimi", "TRY")), 1)))
+                        kur = Decimal(str(checked_rate(kurlar, str(urun.get("para_birimi", "TRY")))))
                         liste = Decimal(str(urun.get("liste_fiyati", 0)))
                         iskonto = Decimal(str(urun.get("tedarikci_iskonto", 0)))
                         kar = Decimal(str(urun.get("kar_marji", 0)))
@@ -294,7 +295,7 @@ kullanici = kimligi_dogrula()
 if kullanici is None:
     st.title("⚡ Sinyal Elektrik")
     st.subheader("Ürün ve Stok Yönetimi | Personel Girişi")
-    st.info("Yetkili hesabınızla giriş yapın. İlk hesaplar Supabase panelinden yönetici tarafından oluşturulur.")
+    st.info("Ürün, stok ve satış işlemleri için hesabınızla giriş yapın.")
     with st.form("giris_formu"):
         email = st.text_input("E-posta adresi")
         password = st.text_input("Şifre", type="password")
@@ -308,22 +309,26 @@ if kullanici is None:
             else:
                 st.rerun()
         except Exception as exc:
-            st.error(f"Giriş yapılamadı: {exc}")
+            st.error("Giriş yapılamadı. E-posta/şifrenizi ve sunucu bağlantısını kontrol edin.")
     st.stop()
 
 is_admin = kullanici["rol"] == "admin"
+def bolume_git(bolum):
+    st.session_state["ana_bolum"] = bolum
+
+
 with st.sidebar:
     st.title("⚡ Sinyal Elektrik")
     st.caption(f"{kullanici['email']} | {'Yönetici' if is_admin else 'Personel'}")
-    menu_items = ["🏠 Ana Sayfa", "🛒 Barkodlu Satış", "📦 Stok ve Fiyat Sorgula", "➕ Stok Girişi", "➖ Stok Çıkışı", "↩️ Satış İptali", "✏️ Ürün Düzenle/Sil"]
-    if is_admin:
-        menu_items += ["📊 Satış Raporları", "📖 Katalog", "📥 Katalog Yükle", "🆕 Ürün Ekle"]
-    menu = st.radio("İşlemler", menu_items, label_visibility="collapsed")
+    ana_bolum = st.radio("Çalışma alanı", ["🏠 Ana Sayfa", "📦 Ürün ve Stok", "🛒 Satış", "📖 Tedarikçi Katalogları"],
+                         key="ana_bolum", label_visibility="collapsed")
+    st.divider()
+    st.caption("Ürünler ve stok • Satış ve sepet • Katalog fiyatları")
     if st.button("Güvenli Çıkış", use_container_width=True):
-        st.session_state.auth_access_token = None
-        st.session_state.pop("satis_sepeti", None)
-        st.session_state.pop("satis_islem_no", None)
+        st.session_state.clear()
         st.rerun()
+
+menu = "🏠 Ana Sayfa"
 
 # Veri Çekme Fonksiyonları
 def get_dukkan_data():
@@ -342,13 +347,24 @@ def get_katalog_data():
 # Kur Çekme Fonksiyonu
 def get_live_rates():
     try:
-        res = requests.get("https://open.er-api.com/v6/latest/TRY", timeout=5).json()
-        rates = res.get("rates", {})
-        usd = 1 / rates.get("USD", 1)
-        eur = 1 / rates.get("EUR", 1)
+        response = requests.get("https://open.er-api.com/v6/latest/TRY", timeout=5)
+        response.raise_for_status()
+        rates = response.json()["rates"]
+        usd, eur = 1 / float(rates["USD"]), 1 / float(rates["EUR"])
+        if not all(Decimal(str(x)).is_finite() and x > 0 for x in (usd, eur)):
+            raise ValueError("Kur geçersiz")
         return {"TRY": 1.0, "USD": round(usd, 4), "EUR": round(eur, 4)}
-    except Exception:
-        return {"TRY": 1.0, "USD": 38.50, "EUR": 41.50}
+    except (requests.RequestException, ValueError, KeyError, ZeroDivisionError, TypeError):
+        return {"TRY": 1.0}
+
+
+def checked_rate(rates, currency):
+    currency = {"TL": "TRY", "₺": "TRY"}.get(currency, currency)
+    rate = rates.get(currency)
+    if rate is None or not Decimal(str(rate)).is_finite() or rate <= 0:
+        raise ValueError(f"{currency} kuru alınamadı. Döviz kurunu yenileyin.")
+    return rate
+
 
 # Session State ile kur hafızası
 if "kurlar" not in st.session_state or "son_kur_guncelleme" not in st.session_state:
@@ -360,169 +376,53 @@ elif time.time() - st.session_state.son_kur_guncelleme > 300:
 
 kurlar = st.session_state.kurlar
 
-st.title("⚡ Sinyal Elektrik | " + menu.split(" ", 1)[1])
+st.title(ana_bolum)
+if ana_bolum == "📦 Ürün ve Stok":
+    secenekler = {"Ürünler ve Fiyatlar": "📦 Stok ve Fiyat Sorgula", "Stok Girişi": "➕ Stok Girişi",
+                  "Stok Çıkışı": "➖ Stok Çıkışı", "Ürün Düzenle": "✏️ Ürün Düzenle/Sil"}
+    if is_admin:
+        secenekler["Yeni Ürün"] = "🆕 Ürün Ekle"
+    secim = st.radio("Ürün ve stok işlemi", list(secenekler), horizontal=True, key="stok_alt")
+    menu = secenekler[secim]
+elif ana_bolum == "🛒 Satış":
+    secenekler = {"Barkod ve Sepet": "🛒 Barkodlu Satış", "Satış İptali / İade": "↩️ Satış İptali"}
+    if is_admin:
+        secenekler["Satış Raporları"] = "📊 Satış Raporları"
+    menu = secenekler[st.radio("Satış işlemi", list(secenekler), horizontal=True, key="satis_alt")]
+elif ana_bolum == "📖 Tedarikçi Katalogları":
+    secenekler = ["Ürünler ve Fiyat Hesabı", "PDF Kataloglar"]
+    if is_admin:
+        secenekler.append("Katalog Yükle")
+    secim = st.radio("Katalog işlemi", secenekler, horizontal=True, key="katalog_alt")
+    menu = "📖 Katalog"
+    render_catalogue(conn, kullanici, kurlar, upload=secim == "Katalog Yükle", pdf_only=secim == "PDF Kataloglar")
+
 if is_admin:
-    with st.expander("Döviz Kurları", expanded=False):
+    with st.expander("Döviz kurları", expanded=False):
         col_usd, col_eur, col_refresh = st.columns(3)
-        col_usd.metric("USD/TRY", f"₺{kurlar['USD']}")
-        col_eur.metric("EUR/TRY", f"₺{kurlar['EUR']}")
+        col_usd.metric("USD/TRY", str(kurlar.get("USD", "Alınamadı")))
+        col_eur.metric("EUR/TRY", str(kurlar.get("EUR", "Alınamadı")))
         if col_refresh.button("Kurları Yenile"):
             st.session_state.kurlar = get_live_rates()
             st.session_state.son_kur_guncelleme = time.time()
             st.rerun()
 
 if menu == "🏠 Ana Sayfa":
-    st.subheader("Hızlı Başlangıç")
     with conn.session as db:
         urun_sayisi, toplam_stok = db.execute(text("SELECT COUNT(*), COALESCE(SUM(stok_adedi),0) FROM urunler")).one()
     c1, c2 = st.columns(2)
     c1.metric("Ürün çeşidi", int(urun_sayisi))
-    c2.metric("Toplam stok (birim)", int(toplam_stok))
-    st.info("Soldaki menüden Barkodlu Satış, Stok Sorgulama, Stok Girişi veya Stok Çıkışı'nı seçin. Mobil cihazlarda menüyü sol üstten açabilirsiniz.")
-    if is_admin:
-        st.caption("Yönetici panelinde maliyetler, kataloglar, satış raporları ve personel yetkileri yönetilir.")
-
-# ----------------------------------------------------
-# 1. SEKME: KATALOG LİSTESİ & ARAMA
-# ----------------------------------------------------
-if is_admin and menu == "📖 Katalog":
-    st.subheader("Marka Katalog Fiyatları")
-    df_kat = get_katalog_data()
-
-    if not df_kat.empty and "urun_adi" in df_kat.columns:
-        # Marka Filtresi ve Arama
-        col_m, col_s = st.columns([1, 2])
-        markalar = ["Tümü"] + sorted(list(df_kat["marka"].dropna().unique()))
-        secilen_marka = col_m.selectbox("Marka Filtrele:", markalar)
-        arama_kat = col_s.text_input("🔍 Ürün Kodu veya Ürün Adı Ara:")
-
-        filtre_df = df_kat.copy()
-        if secilen_marka != "Tümü":
-            filtre_df = filtre_df[filtre_df["marka"] == secilen_marka]
-
-        if arama_kat:
-            filtre_df = filtre_df[
-                filtre_df["urun_adi"].astype(str).str.contains(arama_kat, case=False, na=False) |
-                filtre_df["urun_kodu"].astype(str).str.contains(arama_kat, case=False, na=False)
-            ]
-
-        # Canlı Kur TL Karşılığı Hesaplama
-        def kat_tl_hesapla(row):
-            try:
-                kur = kurlar.get(str(row["para_birimi"]), 1.0)
-                liste = float(row["liste_fiyati"])
-                return round(liste * kur, 2)
-            except Exception:
-                return 0.0
-
-        filtre_df["Liste Fiyatı (TL)"] = filtre_df.apply(kat_tl_hesapla, axis=1)
-
-        tablo_kat_goster = filtre_df[[
-            "marka", "urun_kodu", "urun_adi", "liste_fiyati", "para_birimi", "Liste Fiyatı (TL)"
-        ]].rename(columns={
-            "marka": "Marka",
-            "urun_kodu": "Ürün Kodu",
-            "urun_adi": "Ürün Adı",
-            "liste_fiyati": "Liste Fiyatı (Döviz/TL)",
-            "para_birimi": "Birim",
-            "Liste Fiyatı (TL)": "Güncel Liste Fiyatı (₺)"
-        })
-
-        st.dataframe(tablo_kat_goster, use_container_width=True, hide_index=True)
-        st.caption(f"Toplam {len(tablo_kat_goster)} katalog ürünü listeleniyor.")
-    else:
-        st.info("Henüz katalog ürünü yüklenmedi. 'Katalog Ürün Yükle/Ekle' sekmesinden tekli veya toplu Excel yükleyebilirsiniz.")
-
-# ----------------------------------------------------
-# 2. SEKME: KATALOG ÜRÜN YÜKLE / EKLE
-# ----------------------------------------------------
-if is_admin and menu == "📥 Katalog Yükle":
-    st.subheader("Kataloğa Ürün Ekleme")
-    
-    secim_tipi = st.radio("Ekleme Yöntemi Seçin:", ["📁 Excel / CSV ile Toplu Yükle", "➕ Tek Tek Ürün Ekle"], horizontal=True)
-
-    if secim_tipi == "➕ Tek Tek Ürün Ekle":
-        with st.form("tek_katalog_ekle_form", clear_on_submit=True):
-            col_k1, col_k2 = st.columns(2)
-            k_marka = col_k1.text_input("Marka (Örn: Siemens, Schneider, Viko, Forlife)")
-            k_kod = col_k2.text_input("Ürün Kodu (Örn: 5SY4110-7, BFR430)")
-            
-            k_ad = st.text_input("Ürün Adı")
-            
-            col_k3, col_k4 = st.columns(2)
-            k_fiyat = col_k3.number_input("Liste Fiyatı", min_value=0.0, value=100.0, step=1.0)
-            k_birim = col_k4.selectbox("Para Birimi", ["TRY", "USD", "EUR"])
-
-            kat_kaydet = st.form_submit_button("💾 Kataloğa Kaydet", use_container_width=True)
-            if kat_kaydet:
-                if k_marka and k_ad:
-                    with conn.session as s:
-                        s.execute(
-                            text("""
-                                INSERT INTO katalog_urunleri (marka, urun_kodu, urun_adi, liste_fiyati, para_birimi)
-                                VALUES (:marka, :urun_kodu, :urun_adi, :liste_fiyati, :para_birimi)
-                            """),
-                            {
-                                "marka": str(k_marka).strip(),
-                                "urun_kodu": str(k_kod).strip(),
-                                "urun_adi": str(k_ad).strip(),
-                                "liste_fiyati": float(k_fiyat),
-                                "para_birimi": str(k_birim)
-                            }
-                        )
-                        s.commit()
-                    st.success(f"'{k_ad}' katalog veritabanına eklendi!")
-                    st.rerun()
-                else:
-                    st.error("Lütfen Marka ve Ürün Adı alanlarını doldurun.")
-
-    else:
-        st.markdown("""
-        **Toplu Yükleme Formatı:**
-        Yükleyeceğiniz Excel (`.xlsx`) veya CSV dosyasında şu sütun başlıkları bulunmalıdır:
-        `marka`, `urun_kodu`, `urun_adi`, `liste_fiyati`, `para_birimi`
-        """)
-
-        dosya = st.file_uploader("Excel veya CSV Dosyası Yükleyin", type=["xlsx", "csv"])
-        if dosya:
-            try:
-                if dosya.name.endswith(".csv"):
-                    df_upload = pd.read_csv(dosya)
-                else:
-                    df_upload = pd.read_excel(dosya)
-
-                st.write("Yüklenecek Veri Önizlemesi:")
-                st.dataframe(df_upload.head(5))
-
-                if st.button("🚀 Bu Ürünleri Katalog Veritabanına Aktar", use_container_width=True):
-                    gerekli_kolonlar = ["marka", "urun_kodu", "urun_adi", "liste_fiyati", "para_birimi"]
-                    
-                    # Kolon isimlerini küçük harfe çekelim
-                    df_upload.columns = [str(c).lower().strip() for c in df_upload.columns]
-                    
-                    if all(col in df_upload.columns for col in gerekli_kolonlar):
-                        with conn.session as s:
-                            for _, r in df_upload.iterrows():
-                                s.execute(
-                                    text("""
-                                        INSERT INTO katalog_urunleri (marka, urun_kodu, urun_adi, liste_fiyati, para_birimi)
-                                        VALUES (:marka, :urun_kodu, :urun_adi, :liste_fiyati, :para_birimi)
-                                    """),
-                                    {
-                                        "marka": str(r["marka"]),
-                                        "urun_kodu": str(r["urun_kodu"]),
-                                        "urun_adi": str(r["urun_adi"]),
-                                        "liste_fiyati": float(r["liste_fiyati"]),
-                                        "para_birimi": str(r["para_birimi"]).upper()
-                                    }
-                                )
-                            s.commit()
-                        st.success(f"Tebrikler! Toplam {len(df_upload)} adet katalog ürünü başarıyla aktarıldı.")
-                        st.rerun()
-                    else:
-                        st.error(f"Dosyanızda gerekli sütunlar eksik! Olması gereken sütunlar: {gerekli_kolonlar}")
-            except Exception as e:
-                st.error(f"Dosya işlenirken hata oluştu: {e}")
+    c2.metric("Toplam stok", int(toplam_stok))
+    st.subheader("Ne yapmak istersiniz?")
+    kartlar = [("📦 Ürün ve Stok", "Ürün bul, fiyat gör, stok ekle veya düzenle."),
+               ("🛒 Satış", "Barkod okut, sepete ekle ve satışı tamamla."),
+               ("📖 Tedarikçi Katalogları", "Katalog aç, ürün seç ve satış fiyatını hesapla.")]
+    for col, (baslik, aciklama) in zip(st.columns(3), kartlar):
+        with col:
+            with st.container(border=True):
+                st.markdown("### " + baslik)
+                st.write(aciklama)
+                st.button("Aç", key="home_"+baslik, on_click=bolume_git, args=(baslik,), use_container_width=True)
 
 # ----------------------------------------------------
 # 3. SEKME: DÜKKAN STOK LİSTESİ
@@ -540,7 +440,7 @@ if menu == "📦 Stok ve Fiyat Sorgula":
         def gorunen_fiyat(r):
             try:
                 liste = Decimal(str(r["liste_fiyati"]))
-                kur = Decimal(str(kurlar.get(str(r["para_birimi"]), 1)))
+                kur = Decimal(str(checked_rate(kurlar, str(r["para_birimi"]))))
                 isk = Decimal(str(r["tedarikci_iskonto"]))
                 kar = Decimal(str(r["kar_marji"]))
                 kdv = Decimal(str(r["kdv_orani"]))
@@ -561,7 +461,7 @@ if menu == "📦 Stok ve Fiyat Sorgula":
     elif not df.empty and "urun_adi" in df.columns:
         def hesapla_fiyatlar(row):
             try:
-                kur = kurlar.get(str(row["para_birimi"]), 1.0)
+                kur = checked_rate(kurlar, str(row["para_birimi"]))
                 liste = float(row["liste_fiyati"])
                 iskonto = float(row["tedarikci_iskonto"])
                 kar = float(row["kar_marji"])
@@ -572,7 +472,7 @@ if menu == "📦 Stok ve Fiyat Sorgula":
                 satis_kdvli = satis_kdvsiz * (1 + kdv / 100)
                 return pd.Series([round(alis_tl, 2), round(satis_kdvsiz, 2), round(satis_kdvli, 2)])
             except Exception:
-                return pd.Series([0.0, 0.0, 0.0])
+                return pd.Series([None, None, None])
 
         df[["Maliyet (TL)", "Satış (KDV Hariç)", "Nihai Satış (KDV Dahil)"]] = df.apply(hesapla_fiyatlar, axis=1)
 
@@ -596,9 +496,9 @@ if menu == "📦 Stok ve Fiyat Sorgula":
         arama = st.text_input("🔍 Dükkan Ürünlerinde Arama Yapın", key="stok_arama_kodu")
         if arama:
             gosterilecek_tablo = gosterilecek_tablo[
-                gosterilecek_tablo["Ürün Adı"].astype(str).str.contains(arama, case=False, na=False) |
-                gosterilecek_tablo["Barkod/Kod"].astype(str).str.contains(arama, case=False, na=False) |
-                gosterilecek_tablo["Dükkan / Raf Konumu"].astype(str).str.contains(arama, case=False, na=False)
+                gosterilecek_tablo["Ürün Adı"].astype(str).str.contains(arama, case=False, na=False, regex=False) |
+                gosterilecek_tablo["Barkod/Kod"].astype(str).str.contains(arama, case=False, na=False, regex=False) |
+                gosterilecek_tablo["Dükkan / Raf Konumu"].astype(str).str.contains(arama, case=False, na=False, regex=False)
             ]
 
         st.dataframe(gosterilecek_tablo, use_container_width=True, hide_index=True)
@@ -622,7 +522,7 @@ if menu == "📦 Stok ve Fiyat Sorgula":
 
     # Her kullanıcının yalnızca satış fiyatını görebileceği resimli liste.
     # Ham kayıtlar kartlara yalnızca sunucu tarafında işlenmek üzere aktarılır.
-    if not ham_urunler.empty:
+    if not ham_urunler.empty and st.checkbox("Fotoğraflı ürün kartlarını göster", key="stok_kartlari"):
         filtre_kodu = st.session_state.get("stok_arama_kodu", "").strip()
         gorunen_urunler = ham_urunler
         if filtre_kodu:
@@ -881,7 +781,7 @@ def para_yuvarla(tutar):
 
 
 def urun_satis_fiyati(row, secili_kurlar):
-    kur = Decimal(str(secili_kurlar.get(str(row["para_birimi"]), 1.0)))
+    kur = Decimal(str(checked_rate(secili_kurlar, str(row["para_birimi"]))))
     liste = Decimal(str(row["liste_fiyati"]))
     iskonto = Decimal(str(row["tedarikci_iskonto"]))
     kar = Decimal(str(row["kar_marji"]))
@@ -994,7 +894,7 @@ if menu == "🛒 Barkodlu Satış":
                     st.session_state.satis_islem_no = str(uuid.uuid4())
                     st.rerun()
 
-            st.warning("Satışı onayladığınızda ürün stokları kalıcı olarak azalır. İşlem tek veritabanı transaction'ında kaydedilir.")
+            st.warning("Satışı onayladığınızda ürün stokları kalıcı olarak azalır. Satış iptali bölümünden ürünleri stoğa iade edebilirsiniz.")
             satis_onay = st.button("✅ SATIŞI ONAYLA VE STOKTAN DÜŞ", type="primary", disabled=hata_var)
             if satis_onay:
                 try:
